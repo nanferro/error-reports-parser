@@ -120,7 +120,7 @@
       if (masterIds.length > 10) {
         output += '\n' + masterIds.map((id, i) => `${i + 1}. \`${id}\``).join('\n');
       } else {
-        output += '\n' + masterIds.map(id => `* \`${id}\``).join('\n');
+        output += '\n' + masterIds.map(id => `● \`${id}\``).join('\n');
       }
 
       firstGroup = false;
