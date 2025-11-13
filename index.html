@@ -9,140 +9,190 @@
 <body>
   <div class="container">
     <h1>Webhook Error Parser</h1>
-    <textarea id="input" placeholder="Paste raw error text here..." rows="10" style="width:100%;"></textarea>
+    <label style="display:flex; align-items:center; gap:8px; margin-bottom:20px;">
+      <input type="checkbox" id="platformCheckbox" />
+      platform company
+    </label>
+
+    <textarea 
+      id="input" 
+      placeholder="Paste raw error text here..." 
+      rows="10"
+    ></textarea>
+
     <button id="parseBtn">Parse</button>
-    <textarea id="output" placeholder="Formatted output will appear here..." readonly rows="15" style="width:100%; margin-top: 10px;"></textarea>
+
+    <textarea 
+      id="output" 
+      placeholder="Formatted output will appear here..." 
+      rows="15"
+      style="margin-top:20px;"
+    ></textarea>
+
     <button id="copyBtn">Copy Output</button>
   </div>
 
-  <script>
-  window.onload = () => {
-    document.getElementById('input').value = '';
-    document.getElementById('output').value = '';
-  };
 
-  function parseErrors() {
-    const rawText = document.getElementById('input').value;
+<script>
+window.onload = () => {
+  document.getElementById('input').value = '';
+  document.getElementById('output').value = '';
+};
 
-    // Причесываем ввод
-    const normalized = rawText
-      .replace(/\\?[\r\n]+/g, ' ')
-      .replace(/“|”/g, '"')
-      .replace(/(?<=\w)"(?=\w)/g, '')
-      .replace(/\\+"/g, '"');
+function extractCompany(raw) {
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
-    // Разбиваем по вхождениям masterId
-    const chunks = normalized.split(/(?=["']?masterId["']?\s*[:=])/i)
-      .map(c => c.trim())
-      .filter(c => /masterId/i.test(c));
+  for (const line of lines) {
+    const firstWord = line.split(/\s+/)[0];
 
-    const masterIdPattern = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?([^"'\s,}]+)/;
-    const statusPattern = /["']?status["']?\s*[:=]\s*["']?([0-9]{3}|null)["']?/;
-    const codePattern = /["']?code["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
-    const eventPattern = /["']?event["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
-
-    const masterIdToErrors = new Map();
-
-    for (const chunk of chunks) {
-      const masterIdMatch = chunk.match(masterIdPattern);
-      if (!masterIdMatch) continue;
-
-      const masterId = masterIdMatch[1];
-      const statusMatch = chunk.match(statusPattern);
-      const codeMatch = chunk.match(codePattern);
-      const eventMatch = chunk.match(eventPattern);
-
-      const status = statusMatch && statusMatch[1] && statusMatch[1] !== 'null' ? statusMatch[1] : null;
-      const code = codeMatch ? codeMatch[1] : 'unknown';
-      const event = eventMatch ? eventMatch[1] : 'unknown';
-
-      const errorKey = `${status || ''}|${code || ''}|${event || ''}`;
-
-
-      if (!masterIdToErrors.has(masterId)) {
-        masterIdToErrors.set(masterId, new Set());
-      }
-      masterIdToErrors.get(masterId).add(errorKey);
+    if (/^[a-z]+[A-Za-z0-9]*$/.test(firstWord)) {
+      return firstWord;
     }
+  }
+  return null;
+}
 
-    const errorSetToMasterIds = new Map();
+function parseErrors() {
+  const rawText = document.getElementById('input').value;
+  const isPlatform = document.getElementById('platformCheckbox').checked;
 
-    for (const [masterId, errorsSet] of masterIdToErrors.entries()) {
-      const sortedErrors = [...errorsSet].sort();
-      const key = sortedErrors.join('||');
-
-      if (!errorSetToMasterIds.has(key)) {
-        errorSetToMasterIds.set(key, new Set());
-      }
-      errorSetToMasterIds.get(key).add(masterId);
-    }
-
-    let output = 'hi @channel, we received';
-    let firstGroup = true;
-
-    for (const [errorSetKey, masterIdsSet] of errorSetToMasterIds.entries()) {
-      const errorKeys = errorSetKey.split('||');
-      const masterIds = [...masterIdsSet];
-
-      const parsedErrors = errorKeys.map(err => {
-        const [status, code, event] = err.split('|');
-        return { status, code, event };
-      });
-
-      const uniqueStatuses = [...new Set(parsedErrors.map(e => e.status))].filter(s => s && s !== 'unknown');
-      const uniqueCodes = [...new Set(parsedErrors.map(e => e.code))];
-
-      const hasValidStatus = uniqueStatuses.length > 0;
-      let prefix;
-
-      if (hasValidStatus) {
-        const statusStr = uniqueStatuses.join('/');
-        const codeStr = uniqueCodes.join('/');
-        prefix = `\`${statusStr}\` status webhook error response (\`${codeStr}\`)`;
-      } else {
-        const codeStr = uniqueCodes.join('/');
-        prefix = `webhook error response (\`${codeStr}\`)`;
-      }
-
-      const eventsList = parsedErrors.map(e => `\`${e.event}\``);
-      let eventsStr;
-      if (eventsList.length === 1) {
-        eventsStr = `${eventsList[0]} event`;
-      } else if (eventsList.length === 2) {
-        eventsStr = `${eventsList[0]} and ${eventsList[1]} events`;
-      } else {
-        eventsStr = eventsList.slice(0, -1).join(', ') + ' and ' + eventsList.slice(-1) + ' events';
-      }
-
-      if (!firstGroup) output += '\nand';
-      output += ` ${prefix} for ${eventsStr} for the following ${masterIds.length === 1 ? 'masterId' : 'masterIds'}:`;
-
-      if (masterIds.length > 10) {
-        output += '\n' + masterIds.map((id, i) => `${i + 1}. \`${id}\``).join('\n');
-      } else {
-        output += '\n' + masterIds.map(id => `● \`${id}\``).join('\n');
-      }
-
-      firstGroup = false;
-    }
-
-    if (errorSetToMasterIds.size === 0) {
-      output = 'hi @channel, we received \nCould you please let us know how it looks on your end?';
-    } else {
-      output += '\nCould you please let us know how it looks on your end?';
-    }
-
-    document.getElementById('output').value = output;
+  let companyName = null;
+  if (isPlatform) {
+    companyName = extractCompany(rawText);
   }
 
-  document.getElementById('parseBtn').addEventListener('click', parseErrors);
+  const normalized = rawText
+    .replace(/\\?[\r\n]+/g, " ")
+    .replace(/“|”/g, '"')
+    .replace(/(?<=\w)"(?=\w)/g, "")
+    .replace(/\\"+/g, '"');
 
-  document.getElementById('copyBtn').addEventListener('click', () => {
-    const outputTextarea = document.getElementById('output');
-    outputTextarea.select();
-    outputTextarea.setSelectionRange(0, 99999);
-    document.execCommand('copy');
-  });
+  const chunks = normalized
+    .split(/(?=["']?masterId["']?\s*[:=])/i)
+    .map((c) => c.trim())
+    .filter((c) => /masterId/i.test(c));
+
+  const masterIdPattern = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?([^"'\s,}]+)/;
+  const statusPattern = /["']?status["']?\s*[:=]\s*["']?([0-9]{3}|null)["']?/;
+  const codePattern = /["']?code["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
+  const eventPattern = /["']?event["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
+
+  const masterIdToErrors = new Map();
+
+  for (const chunk of chunks) {
+    const masterIdMatch = chunk.match(masterIdPattern);
+    if (!masterIdMatch) continue;
+
+    const masterId = masterIdMatch[1];
+    const statusMatch = chunk.match(statusPattern);
+    const codeMatch = chunk.match(codePattern);
+    const eventMatch = chunk.match(eventPattern);
+
+    const status =
+      statusMatch && statusMatch[1] && statusMatch[1] !== "null"
+        ? statusMatch[1]
+        : null;
+    const code = codeMatch ? codeMatch[1] : "unknown";
+    const event = eventMatch ? eventMatch[1] : "unknown";
+
+    const errorKey = `${status || ""}|${code || ""}|${event || ""}`;
+
+    if (!masterIdToErrors.has(masterId)) {
+      masterIdToErrors.set(masterId, new Set());
+    }
+    masterIdToErrors.get(masterId).add(errorKey);
+  }
+
+  const errorSetToMasterIds = new Map();
+
+  for (const [masterId, errorsSet] of masterIdToErrors.entries()) {
+    const sortedErrors = [...errorsSet].sort();
+    const key = sortedErrors.join("||");
+
+    if (!errorSetToMasterIds.has(key)) {
+      errorSetToMasterIds.set(key, new Set());
+    }
+    errorSetToMasterIds.get(key).add(masterId);
+  }
+
+  let output = companyName
+    ? `hi @channel, for ${companyName} we received`
+    : `hi @channel, we received`;
+
+  let firstGroup = true;
+
+  for (const [errorSetKey, masterIdsSet] of errorSetToMasterIds.entries()) {
+    const errorKeys = errorSetKey.split("||");
+    const masterIds = [...masterIdsSet];
+
+    const parsedErrors = errorKeys.map((err) => {
+      const [status, code, event] = err.split("|");
+      return { status, code, event };
+    });
+
+    const uniqueStatuses = [
+      ...new Set(parsedErrors.map((e) => e.status)),
+    ].filter((s) => s && s !== "unknown");
+    const uniqueCodes = [...new Set(parsedErrors.map((e) => e.code))];
+
+    const hasValidStatus = uniqueStatuses.length > 0;
+    let prefix;
+
+    if (hasValidStatus) {
+      const statusStr = uniqueStatuses.join("/");
+      const codeStr = uniqueCodes.join("/");
+      prefix = `\`${statusStr}\` status webhook error response (\`${codeStr}\`)`;
+    } else {
+      const codeStr = uniqueCodes.join("/");
+      prefix = `webhook error response (\`${codeStr}\`)`;
+    }
+
+    const eventsList = parsedErrors.map((e) => `\`${e.event}\``);
+    let eventsStr;
+    if (eventsList.length === 1) {
+      eventsStr = `${eventsList[0]} event`;
+    } else if (eventsList.length === 2) {
+      eventsStr = `${eventsList[0]} and ${eventsList[1]} events`;
+    } else {
+      eventsStr =
+        eventsList.slice(0, -1).join(", ") +
+        " and " +
+        eventsList.slice(-1) +
+        " events";
+    }
+
+    if (!firstGroup) output += "\nand";
+    output += ` ${prefix} for ${eventsStr} for the following ${
+      masterIds.length === 1 ? "masterId" : "masterIds"
+    }:`;
+
+
+    if (masterIds.length > 10) {
+      output +=
+        "\n" +
+        masterIds.map((id, i) => `${i + 1}. \`${id}\``).join("\n");
+    } else {
+      output +=
+        "\n" + masterIds.map((id) => `● \`${id}\``).join("\n");
+    }
+
+    firstGroup = false;
+  }
+
+  output += "\nCould you please let us know how it looks on your end?";
+
+  document.getElementById("output").value = output;
+}
+
+document.getElementById("parseBtn").addEventListener("click", parseErrors);
+
+document.getElementById("copyBtn").addEventListener("click", () => {
+  const outputTextarea = document.getElementById("output");
+  outputTextarea.select();
+  outputTextarea.setSelectionRange(0, 99999);
+  document.execCommand("copy");
+});
 </script>
+
 </body>
 </html>
