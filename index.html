@@ -9,190 +9,290 @@
 <body>
   <div class="container">
     <h1>Webhook Error Parser</h1>
-    <label style="display:flex; align-items:center; gap:8px; margin-bottom:20px;">
+
+    <label>
       <input type="checkbox" id="platformCheckbox" />
       platform company
     </label>
 
-    <textarea 
-      id="input" 
-      placeholder="Paste raw error text here..." 
-      rows="10"
-    ></textarea>
-
+    <textarea id="input" placeholder="Paste raw error text here..."></textarea>
     <button id="parseBtn">Parse</button>
 
-    <textarea 
-      id="output" 
-      placeholder="Formatted output will appear here..." 
-      rows="15"
-      style="margin-top:20px;"
-    ></textarea>
-
+    <textarea id="output" placeholder="Formatted output will appear here..."></textarea>
     <button id="copyBtn">Copy Output</button>
   </div>
 
+  <script>
+    const EVENT_ORDER = [
+      e => e === 'FORM_SUBMITTED',
+      e => e.startsWith('LAB'),
+      e => e.startsWith('BOOKING'),
+      e => e === 'RX_WRITTEN',
+      e => e.startsWith('PHARMACY'),
+      e => e === 'CS_MESSAGE',
+      e => e === 'DOCTOR_CHAT',
+      e => e === 'CONSULT_CONCLUDED',
+    ];
 
-<script>
-window.onload = () => {
-  document.getElementById('input').value = '';
-  document.getElementById('output').value = '';
-};
+    const KEY_SEP   = '\x00';
+    const FIELD_SEP = '\x01';
 
-function extractCompany(raw) {
-  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const CONTEXT_BEFORE = 120;
+    const CONTEXT_AFTER  = 120;
 
-  for (const line of lines) {
-    const firstWord = line.split(/\s+/)[0];
+    const UNKNOWN = 'unknown';
 
-    if (/^[a-z]+[A-Za-z0-9]*$/.test(firstWord)) {
-      return firstWord;
+    function eventPriority(event) {
+      const idx = EVENT_ORDER.findIndex(fn => fn(event));
+      return idx === -1 ? EVENT_ORDER.length : idx;
     }
-  }
-  return null;
-}
 
-function parseErrors() {
-  const rawText = document.getElementById('input').value;
-  const isPlatform = document.getElementById('platformCheckbox').checked;
-
-  let companyName = null;
-  if (isPlatform) {
-    companyName = extractCompany(rawText);
-  }
-
-  const normalized = rawText
-    .replace(/\\?[\r\n]+/g, " ")
-    .replace(/“|”/g, '"')
-    .replace(/(?<=\w)"(?=\w)/g, "")
-    .replace(/\\"+/g, '"');
-
-  const chunks = normalized
-    .split(/(?=["']?masterId["']?\s*[:=])/i)
-    .map((c) => c.trim())
-    .filter((c) => /masterId/i.test(c));
-
-  const masterIdPattern = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?([^"'\s,}]+)/;
-  const statusPattern = /["']?status["']?\s*[:=]\s*["']?([0-9]{3}|null)["']?/;
-  const codePattern = /["']?code["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
-  const eventPattern = /["']?event["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
-
-  const masterIdToErrors = new Map();
-
-  for (const chunk of chunks) {
-    const masterIdMatch = chunk.match(masterIdPattern);
-    if (!masterIdMatch) continue;
-
-    const masterId = masterIdMatch[1];
-    const statusMatch = chunk.match(statusPattern);
-    const codeMatch = chunk.match(codePattern);
-    const eventMatch = chunk.match(eventPattern);
-
-    const status =
-      statusMatch && statusMatch[1] && statusMatch[1] !== "null"
-        ? statusMatch[1]
-        : null;
-    const code = codeMatch ? codeMatch[1] : "unknown";
-    const event = eventMatch ? eventMatch[1] : "unknown";
-
-    const errorKey = `${status || ""}|${code || ""}|${event || ""}`;
-
-    if (!masterIdToErrors.has(masterId)) {
-      masterIdToErrors.set(masterId, new Set());
+    function sortByEventPriority(events) {
+      return [...events].sort((a, b) => eventPriority(a) - eventPriority(b));
     }
-    masterIdToErrors.get(masterId).add(errorKey);
-  }
 
-  const errorSetToMasterIds = new Map();
-
-  for (const [masterId, errorsSet] of masterIdToErrors.entries()) {
-    const sortedErrors = [...errorsSet].sort();
-    const key = sortedErrors.join("||");
-
-    if (!errorSetToMasterIds.has(key)) {
-      errorSetToMasterIds.set(key, new Set());
+    function normalizeText(raw) {
+      return raw
+        .replace(/\\?[\r\n]+/g, ' ')
+        .replace(/[""]/g, '"')
+        .replace(/(?<=\w)"(?=\w)/g, '')
+        .replace(/\\"+/g, '"');
     }
-    errorSetToMasterIds.get(key).add(masterId);
-  }
 
-  let output = companyName
-    ? `hi @channel, for \`${companyName}\` we received`
-    : `hi @channel, we received`;
+    function serializeError(status, code, event) {
+      return [status, code, event].join(FIELD_SEP);
+    }
 
-  let firstGroup = true;
-
-  for (const [errorSetKey, masterIdsSet] of errorSetToMasterIds.entries()) {
-    const errorKeys = errorSetKey.split("||");
-    const masterIds = [...masterIdsSet];
-
-    const parsedErrors = errorKeys.map((err) => {
-      const [status, code, event] = err.split("|");
+    function deserializeError(entry) {
+      const [status, code, event] = entry.split(FIELD_SEP);
       return { status, code, event };
+    }
+
+    function serializeErrorSet(errors) {
+      return [...errors].sort().join(KEY_SEP);
+    }
+
+    function deserializeErrorSet(key) {
+      return key.split(KEY_SEP).map(deserializeError);
+    }
+
+    function extractMasterIdErrors(normalized) {
+      const masterIdRe      = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?[^"'\s,}]+/g;
+      const masterIdPattern = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?([^"'\s,}]+)/;
+      const statusPattern   = /["']?status["']?\s*[:=]\s*["']?([0-9]{3}|null|undefined)["']?/;
+      const codePattern     = /["']?code["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
+      const eventPattern    = /["']?event["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
+
+      const positions = [...normalized.matchAll(masterIdRe)].map(m => m.index);
+      const result = new Map();
+
+      for (let i = 0; i < positions.length; i++) {
+        const start = Math.max(0, positions[i] - CONTEXT_BEFORE);
+        const end   = Math.min(normalized.length, positions[i] + CONTEXT_AFTER);
+
+        const chunk = normalized.slice(start, end);
+
+        const masterId = chunk.match(masterIdPattern)?.[1];
+        if (!masterId) continue;
+
+        const statusVal = chunk.match(statusPattern)?.[1];
+        const status =
+          statusVal && statusVal !== 'null' && statusVal !== 'undefined'
+            ? statusVal
+            : '';
+
+        const code  = chunk.match(codePattern)?.[1] ?? UNKNOWN;
+        const event = chunk.match(eventPattern)?.[1] ?? UNKNOWN;
+
+        if (!result.has(masterId)) result.set(masterId, new Set());
+        result.get(masterId).add(serializeError(status, code, event));
+      }
+
+      return result;
+    }
+
+    function parseSegment(text) {
+      return extractMasterIdErrors(normalizeText(text));
+    }
+
+    function splitIntoCompanySegments(raw) {
+      const lines = raw.split(/\r?\n/);
+      const segments = [];
+      let currentCompany = null;
+      let currentLines = [];
+
+      for (const line of lines) {
+        const first = line.trim().split(/\s+/)[0];
+        const isCompanyName = first && /^[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*$/.test(first);
+
+        if (isCompanyName) {
+          if (currentLines.length) {
+            segments.push({ company: currentCompany, text: currentLines.join('\n') });
+          }
+          currentCompany = first;
+          currentLines = [line];
+        } else {
+          currentLines.push(line);
+        }
+      }
+
+      if (currentLines.length) {
+        segments.push({ company: currentCompany, text: currentLines.join('\n') });
+      }
+
+      return segments.length ? segments : [{ company: null, text: raw }];
+    }
+
+    function groupByErrorSet(masterIdToErrors, company = null) {
+      const map = new Map();
+      for (const [masterId, errors] of masterIdToErrors) {
+        const key = serializeErrorSet(errors);
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push({ masterId, company });
+      }
+      return map;
+    }
+
+    function formatEventList(events) {
+      const quoted = events.map(e => `\`${e}\``);
+      if (quoted.length === 1) return `${quoted[0]} event`;
+      if (quoted.length === 2) return `${quoted[0]} and ${quoted[1]} events`;
+      return `${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]} events`;
+    }
+
+    function formatMasterIdList(entries, showCompany) {
+      const numbered = entries.length > 10;
+      return entries.map(({ masterId, company }, i) => {
+        const companyTag = showCompany && company ? ` for \`${company}\`` : '';
+        return numbered
+          ? `${i + 1}. \`${masterId}\`${companyTag}`
+          : `● \`${masterId}\`${companyTag}`;
+      }).join('\n');
+    }
+
+    function buildGroupBlock(errorSetKey, entries, showCompany) {
+      const errors = deserializeErrorSet(errorSetKey);
+
+      const sortedErrors = sortByEventPriority(errors.map(e => e.event))
+        .map(ev => errors.filter(e => e.event === ev))
+        .flat();
+
+      const sortedEvents = sortedErrors.map(e => e.event);
+
+      const statuses = [...new Set(sortedErrors.map(e => e.status))].filter(Boolean);
+      const codes    = [...new Set(sortedErrors.map(e => e.code))];
+
+      const statusStr = statuses.length ? `\`${statuses.join('/')}\` status ` : '';
+      const prefix    = `${statusStr}webhook error response (\`${codes.join('/')}\`)`;
+      const label     = entries.length === 1 ? 'masterId' : 'masterIds';
+
+      return ` ${prefix} for ${formatEventList(sortedEvents)} for the following ${label}:\n${formatMasterIdList(entries, showCompany)}`;
+    }
+
+    function buildSingleCompanyOutput(masterIdToErrors) {
+      const grouped = groupByErrorSet(masterIdToErrors);
+      return [...grouped.entries()]
+        .map(([key, entries], i) => (i > 0 ? '\nand' : '') + buildGroupBlock(key, entries, false))
+        .join('');
+    }
+
+    function buildMultiCompanyOutput(segments) {
+      const errorSetToEntries = new Map();
+
+      for (const { company, text } of segments) {
+        for (const [masterId, errors] of parseSegment(text)) {
+          const key = serializeErrorSet(errors);
+          if (!errorSetToEntries.has(key)) errorSetToEntries.set(key, []);
+          errorSetToEntries.get(key).push({ masterId, company });
+        }
+      }
+
+      const shared = [];
+      const uniqueByCompany = new Map();
+
+      for (const [key, entries] of errorSetToEntries) {
+        const companies = new Set(entries.map(e => e.company));
+        if (companies.size > 1) {
+          shared.push([key, entries]);
+        } else {
+          const company = [...companies][0];
+          if (!uniqueByCompany.has(company)) uniqueByCompany.set(company, []);
+          uniqueByCompany.get(company).push([key, entries]);
+        }
+      }
+
+      const sharedBlocks = shared
+        .map(([key, entries], i) =>
+          (i === 0 ? ' ' : '\nand ') + `we received${buildGroupBlock(key, entries, true)}`
+        )
+        .join('');
+
+      const uniqueBlocks = [...uniqueByCompany.entries()]
+        .flatMap(([company, groups]) =>
+          groups.map(([key, entries]) =>
+            `for \`${company}\` we received${buildGroupBlock(key, entries, false)}`
+          )
+        )
+        .join('\n');
+
+      return [sharedBlocks, uniqueBlocks].filter(Boolean).join('\n');
+    }
+
+    function formatOutput(rawText, isPlatform) {
+      if (!isPlatform) {
+        return `hi @channel, we received${buildSingleCompanyOutput(parseSegment(rawText))}`;
+      }
+
+      const segments = splitIntoCompanySegments(rawText).filter(s => s.company);
+
+      if (!segments.length) {
+        return `hi @channel, we received${buildSingleCompanyOutput(parseSegment(rawText))}`;
+      }
+
+      if (segments.length === 1) {
+        return `hi @channel, for \`${segments[0].company}\` we received${buildSingleCompanyOutput(parseSegment(segments[0].text))}`;
+      }
+
+      return `hi @channel, ${buildMultiCompanyOutput(segments)}`;
+    }
+
+    document.getElementById('parseBtn').addEventListener('click', () => {
+      const rawText = document.getElementById('input').value;
+      if (!rawText.trim()) return;
+
+      const isPlatform = document.getElementById('platformCheckbox').checked;
+      const outputEl = document.getElementById('output');
+
+      try {
+        outputEl.value =
+          formatOutput(rawText, isPlatform) +
+          '\nCould you please let us know how it looks on your end?';
+      } catch (e) {
+        console.error(e);
+        outputEl.value = 'Failed to parse input';
+      }
     });
 
-    const uniqueStatuses = [
-      ...new Set(parsedErrors.map((e) => e.status)),
-    ].filter((s) => s && s !== "unknown");
-    const uniqueCodes = [...new Set(parsedErrors.map((e) => e.code))];
+    document.getElementById('copyBtn').addEventListener('click', () => {
+      const output = document.getElementById('output').value;
+      if (!output.trim()) return;
 
-    const hasValidStatus = uniqueStatuses.length > 0;
-    let prefix;
+      const btn = document.getElementById('copyBtn');
 
-    if (hasValidStatus) {
-      const statusStr = uniqueStatuses.join("/");
-      const codeStr = uniqueCodes.join("/");
-      prefix = `\`${statusStr}\` status webhook error response (\`${codeStr}\`)`;
-    } else {
-      const codeStr = uniqueCodes.join("/");
-      prefix = `webhook error response (\`${codeStr}\`)`;
-    }
+      navigator.clipboard.writeText(output)
+        .then(() => {
+          btn.textContent = '✅ Copied!';
+          btn.classList.add('copied');
 
-    const eventsList = parsedErrors.map((e) => `\`${e.event}\``);
-    let eventsStr;
-    if (eventsList.length === 1) {
-      eventsStr = `${eventsList[0]} event`;
-    } else if (eventsList.length === 2) {
-      eventsStr = `${eventsList[0]} and ${eventsList[1]} events`;
-    } else {
-      eventsStr =
-        eventsList.slice(0, -1).join(", ") +
-        " and " +
-        eventsList.slice(-1) +
-        " events";
-    }
-
-    if (!firstGroup) output += "\nand";
-    output += ` ${prefix} for ${eventsStr} for the following ${
-      masterIds.length === 1 ? "masterId" : "masterIds"
-    }:`;
-
-
-    if (masterIds.length > 10) {
-      output +=
-        "\n" +
-        masterIds.map((id, i) => `${i + 1}. \`${id}\``).join("\n");
-    } else {
-      output +=
-        "\n" + masterIds.map((id) => `● \`${id}\``).join("\n");
-    }
-
-    firstGroup = false;
-  }
-
-  output += "\nCould you please let us know how it looks on your end?";
-
-  document.getElementById("output").value = output;
-}
-
-document.getElementById("parseBtn").addEventListener("click", parseErrors);
-
-document.getElementById("copyBtn").addEventListener("click", () => {
-  const outputTextarea = document.getElementById("output");
-  outputTextarea.select();
-  outputTextarea.setSelectionRange(0, 99999);
-  document.execCommand("copy");
-});
-</script>
-
+          setTimeout(() => {
+            btn.textContent = 'Copy Output';
+            btn.classList.remove('copied');
+          }, 1500);
+        })
+        .catch(() => {
+          alert('Copy failed');
+        });
+    });
+  </script>
 </body>
 </html>
