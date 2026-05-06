@@ -34,13 +34,16 @@
       e => e === 'CONSULT_CONCLUDED',
     ];
 
+    // Non-printable separators — safe from collisions with any real field values
     const KEY_SEP   = '\x00';
     const FIELD_SEP = '\x01';
 
+    // How many characters before the masterId position to include in each chunk.
+    // Axios error payloads typically place status/code/event within ~100 chars
+    // before the masterId field, so 120 gives a comfortable buffer.
     const CONTEXT_BEFORE = 120;
-    const CONTEXT_AFTER  = 120;
 
-    const UNKNOWN = 'unknown';
+    // --- Pure utilities ---
 
     function eventPriority(event) {
       const idx = EVENT_ORDER.findIndex(fn => fn(event));
@@ -59,6 +62,8 @@
         .replace(/\\"+/g, '"');
     }
 
+    // --- Serialization ---
+
     function serializeError(status, code, event) {
       return [status, code, event].join(FIELD_SEP);
     }
@@ -76,33 +81,31 @@
       return key.split(KEY_SEP).map(deserializeError);
     }
 
-    function extractMasterIdErrors(normalized) {
-      const masterIdPattern = /"masterId"\s*:\s*"([^"]+)"/g;
+    // --- Parsing ---
 
+    function extractMasterIdErrors(normalized) {
+      const masterIdRe      = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?[^"'\s,}]+/g;
+      const masterIdPattern = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?([^"'\s,}]+)/;
+      const statusPattern   = /["']?status["']?\s*[:=]\s*["']?([0-9]{3}|null)["']?/;
+      const codePattern     = /["']?code["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
+      const eventPattern    = /["']?event["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
+
+      const positions = [...normalized.matchAll(masterIdRe)].map(m => m.index);
       const result = new Map();
 
-      for (const match of normalized.matchAll(masterIdPattern)) {
-        const masterId = match[1];
-        const index = match.index;
-
+      for (let i = 0; i < positions.length; i++) {
         const chunk = normalized.slice(
-          Math.max(0, index - 1000),
-          Math.min(normalized.length, index + 1000)
+          Math.max(0, positions[i] - CONTEXT_BEFORE),
+          positions[i + 1] ?? normalized.length
         );
 
-        const eventMatch = chunk.match(/"event"\s*:\s*"([^"]+)"/);
-        const codeMatch  = chunk.match(/"code"\s*:\s*"([^"]+)"/);
-        const statusMatch = chunk.match(/"status"\s*:\s*([0-9]{3}|null|undefined)/);
+        const masterId = chunk.match(masterIdPattern)?.[1];
+        if (!masterId) continue;
 
-        const event = eventMatch?.[1] ?? UNKNOWN;
-
-        const statusVal = statusMatch?.[1];
-        const status =
-          statusVal && statusVal !== 'null' && statusVal !== 'undefined'
-            ? statusVal
-            : '';
-
-        const code = codeMatch?.[1] ?? UNKNOWN;
+        const statusVal = chunk.match(statusPattern)?.[1];
+        const status = statusVal && statusVal !== 'null' ? statusVal : '';
+        const code   = chunk.match(codePattern)?.[1] ?? 'unknown';
+        const event  = chunk.match(eventPattern)?.[1] ?? 'unknown';
 
         if (!result.has(masterId)) result.set(masterId, new Set());
         result.get(masterId).add(serializeError(status, code, event));
@@ -143,6 +146,8 @@
       return segments.length ? segments : [{ company: null, text: raw }];
     }
 
+    // --- Grouping ---
+
     function groupByErrorSet(masterIdToErrors, company = null) {
       const map = new Map();
       for (const [masterId, errors] of masterIdToErrors) {
@@ -157,7 +162,7 @@
       const quoted = events.map(e => `\`${e}\``);
       if (quoted.length === 1) return `${quoted[0]} event`;
       if (quoted.length === 2) return `${quoted[0]} and ${quoted[1]} events`;
-      return `${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]} events`;
+      return `${quoted.slice(0, -1).join(', ')} and ${quoted.at(-1)} events`;
     }
 
     function formatMasterIdList(entries, showCompany) {
@@ -171,13 +176,13 @@
     }
 
     function buildGroupBlock(errorSetKey, entries, showCompany) {
-      const errors = deserializeErrorSet(errorSetKey);
-
-      const sortedErrors = sortByEventPriority(errors.map(e => e.event))
-        .map(ev => errors.filter(e => e.event === ev))
-        .flat();
-
-      const sortedEvents = sortedErrors.map(e => e.event);
+      const sortedEntries = showCompany
+        ? [...entries].sort((a, b) => (a.company || '').localeCompare(b.company || ''))
+        : entries;
+      entries = sortedEntries;
+      const errors       = deserializeErrorSet(errorSetKey);
+      const sortedEvents = sortByEventPriority(errors.map(e => e.event));
+      const sortedErrors = sortedEvents.map(ev => errors.find(e => e.event === ev));
 
       const statuses = [...new Set(sortedErrors.map(e => e.status))].filter(Boolean);
       const codes    = [...new Set(sortedErrors.map(e => e.code))];
@@ -199,8 +204,12 @@
     function buildMultiCompanyOutput(segments) {
       const errorSetToEntries = new Map();
 
+      const seen = new Set();
       for (const { company, text } of segments) {
         for (const [masterId, errors] of parseSegment(text)) {
+          const dedupKey = masterId + '\x02' + company;
+          if (seen.has(dedupKey)) continue;
+          seen.add(dedupKey);
           const key = serializeErrorSet(errors);
           if (!errorSetToEntries.has(key)) errorSetToEntries.set(key, []);
           errorSetToEntries.get(key).push({ masterId, company });
@@ -227,7 +236,7 @@
         )
         .join('');
 
-      const uniqueBlocks = [...uniqueByCompany.entries()]
+      const uniqueBlocks = [...uniqueByCompany.entries()].sort((a, b) => a[0].localeCompare(b[0]))
         .flatMap(([company, groups]) =>
           groups.map(([key, entries]) =>
             `for \`${company}\` we received${buildGroupBlock(key, entries, false)}`
@@ -261,37 +270,21 @@
       if (!rawText.trim()) return;
 
       const isPlatform = document.getElementById('platformCheckbox').checked;
-      const outputEl = document.getElementById('output');
-
-      try {
-        outputEl.value =
-          formatOutput(rawText, isPlatform) +
-          '\nCould you please let us know how it looks on your end?';
-      } catch (e) {
-        console.error(e);
-        outputEl.value = 'Failed to parse input';
-      }
+      document.getElementById('output').value =
+        formatOutput(rawText, isPlatform) + '\nCould you please let us know how it looks on your end?';
     });
 
     document.getElementById('copyBtn').addEventListener('click', () => {
       const output = document.getElementById('output').value;
       if (!output.trim()) return;
-
+      navigator.clipboard.writeText(output);
       const btn = document.getElementById('copyBtn');
-
-      navigator.clipboard.writeText(output)
-        .then(() => {
-          btn.textContent = '✅ Copied!';
-          btn.classList.add('copied');
-
-          setTimeout(() => {
-            btn.textContent = 'Copy Output';
-            btn.classList.remove('copied');
-          }, 1500);
-        })
-        .catch(() => {
-          alert('Copy failed');
-        });
+      btn.textContent = '✅ Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = 'Copy Output';
+        btn.classList.remove('copied');
+      }, 1500);
     });
   </script>
 </body>
