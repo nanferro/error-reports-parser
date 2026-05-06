@@ -77,32 +77,32 @@
     }
 
     function extractMasterIdErrors(normalized) {
-      const masterIdRe      = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?[^"'\s,}]+/g;
-      const masterIdPattern = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?([^"'\s,}]+)/;
-      const statusPattern   = /["']?status["']?\s*[:=]\s*["']?([0-9]{3}|null|undefined)["']?/;
-      const codePattern     = /["']?code["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
-      const eventPattern    = /["']?event["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
+      const masterIdPattern = /"masterId"\s*:\s*"([^"]+)"/g;
 
-      const positions = [...normalized.matchAll(masterIdRe)].map(m => m.index);
       const result = new Map();
 
-      for (let i = 0; i < positions.length; i++) {
-        const start = Math.max(0, positions[i] - CONTEXT_BEFORE);
-        const end   = Math.min(normalized.length, positions[i] + CONTEXT_AFTER);
+      for (const match of normalized.matchAll(masterIdPattern)) {
+        const masterId = match[1];
+        const index = match.index;
 
-        const chunk = normalized.slice(start, end);
+        const chunk = normalized.slice(
+          Math.max(0, index - 1000),
+          Math.min(normalized.length, index + 1000)
+        );
 
-        const masterId = chunk.match(masterIdPattern)?.[1];
-        if (!masterId) continue;
+        const eventMatch = chunk.match(/"event"\s*:\s*"([^"]+)"/);
+        const codeMatch  = chunk.match(/"code"\s*:\s*"([^"]+)"/);
+        const statusMatch = chunk.match(/"status"\s*:\s*([0-9]{3}|null|undefined)/);
 
-        const statusVal = chunk.match(statusPattern)?.[1];
+        const event = eventMatch?.[1] ?? UNKNOWN;
+
+        const statusVal = statusMatch?.[1];
         const status =
           statusVal && statusVal !== 'null' && statusVal !== 'undefined'
             ? statusVal
             : '';
 
-        const code  = chunk.match(codePattern)?.[1] ?? UNKNOWN;
-        const event = chunk.match(eventPattern)?.[1] ?? UNKNOWN;
+        const code = codeMatch?.[1] ?? UNKNOWN;
 
         if (!result.has(masterId)) result.set(masterId, new Set());
         result.get(masterId).add(serializeError(status, code, event));
