@@ -20,6 +20,8 @@
 
     <textarea id="output" placeholder="Formatted output will appear here..."></textarea>
     <button id="copyBtn">Copy Output</button>
+
+    <div id="errorBox" class="error-box" hidden></div>
   </div>
 
   <script>
@@ -34,16 +36,10 @@
       e => e === 'CONSULT_CONCLUDED',
     ];
 
-    // Non-printable separators — safe from collisions with any real field values
-    const KEY_SEP   = '\x00';
+    const KEY_SEP = '\x00';
     const FIELD_SEP = '\x01';
-
-    // How many characters before the masterId position to include in each chunk.
-    // Axios error payloads typically place status/code/event within ~100 chars
-    // before the masterId field, so 120 gives a comfortable buffer.
-    const CONTEXT_BEFORE = 120;
-
-    // --- Pure utilities ---
+    const EMAIL_MARKER = 'admin@support.belugahealth.com';
+    const CLIPPED_RE = /\[Message clipped\]/i;
 
     function eventPriority(event) {
       const idx = EVENT_ORDER.findIndex(fn => fn(event));
@@ -62,10 +58,8 @@
         .replace(/\\"+/g, '"');
     }
 
-    // --- Serialization ---
-
     function serializeError(status, code, event) {
-      return [status, code, event].join(FIELD_SEP);
+      return [status || '', code || 'unknown', event || 'unknown'].join(FIELD_SEP);
     }
 
     function deserializeError(entry) {
@@ -81,85 +75,88 @@
       return key.split(KEY_SEP).map(deserializeError);
     }
 
-    // --- Parsing ---
-
     function extractMasterIdErrors(normalized) {
-      const masterIdRe      = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?[^"'\s,}]+/g;
-      const masterIdPattern = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?([^"'\s,}]+)/;
-      const statusPattern   = /["']?status["']?\s*[:=]\s*["']?([0-9]{3}|null)["']?/;
-      const codePattern     = /["']?code["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
-      const eventPattern    = /["']?event["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
+      const masterIdPattern = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?([^"'\s,}]+)/g;
+      const statusPattern = /["']?status["']?\s*[:=]\s*["']?([0-9]{3}|null)["']?/;
+      const codePattern = /["']?code["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
+      const eventPattern = /["']?event["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
 
-      const positions = [...normalized.matchAll(masterIdRe)].map(m => m.index);
-      const result = new Map();
+      const status = normalized.match(statusPattern)?.[1]?.replace('null', '') || '';
+      const code = normalized.match(codePattern)?.[1] ?? 'unknown';
+      const event = normalized.match(eventPattern)?.[1] ?? 'unknown';
 
-      for (let i = 0; i < positions.length; i++) {
-        const chunk = normalized.slice(
-          Math.max(0, positions[i] - CONTEXT_BEFORE),
-          positions[i + 1] ?? normalized.length
-        );
+      const masterIds = [...normalized.matchAll(masterIdPattern)].map(m => m[1]);
 
-        const masterId = chunk.match(masterIdPattern)?.[1];
-        if (!masterId) continue;
+      const found = new Map();
+      const missing = [];
 
-        const statusVal = chunk.match(statusPattern)?.[1];
-        const status = statusVal && statusVal !== 'null' ? statusVal : '';
-        const code   = chunk.match(codePattern)?.[1] ?? 'unknown';
-        const event  = chunk.match(eventPattern)?.[1] ?? 'unknown';
-
-        if (!result.has(masterId)) result.set(masterId, new Set());
-        result.get(masterId).add(serializeError(status, code, event));
-      }
-
-      return result;
-    }
-
-    function parseSegment(text) {
-      return extractMasterIdErrors(normalizeText(text));
-    }
-
-    function splitIntoCompanySegments(raw) {
-      const lines = raw.split(/\r?\n/);
-      const segments = [];
-      let currentCompany = null;
-      let currentLines = [];
-
-      for (const line of lines) {
-        const first = line.trim().split(/\s+/)[0];
-        const isCompanyName = first && /^[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*$/.test(first);
-
-        if (isCompanyName) {
-          if (currentLines.length) {
-            segments.push({ company: currentCompany, text: currentLines.join('\n') });
-          }
-          currentCompany = first;
-          currentLines = [line];
-        } else {
-          currentLines.push(line);
+      if (!masterIds.length) {
+        if (event !== 'unknown' || status || code !== 'unknown') {
+          missing.push({ event, status, code });
         }
+        return { found, missing };
       }
 
-      if (currentLines.length) {
-        segments.push({ company: currentCompany, text: currentLines.join('\n') });
+      for (const masterId of masterIds) {
+        if (!found.has(masterId)) found.set(masterId, new Set());
+        found.get(masterId).add(serializeError(status, code, event));
       }
 
-      return segments.length ? segments : [{ company: null, text: raw }];
+      return { found, missing };
     }
 
-    // --- Grouping ---
+    function extractCompany(text, isPlatform) {
+      if (!text) return null;
 
-    function groupByErrorSet(masterIdToErrors, company = null) {
-      const map = new Map();
-      for (const [masterId, errors] of masterIdToErrors) {
-        const key = serializeErrorSet(errors);
-        if (!map.has(key)) map.set(key, []);
-        map.get(key).push({ masterId, company });
+      const lines = text
+        .split(/\r?\n/)
+        .map(l => l.trim())
+        .filter(Boolean);
+
+      const mutedIndex = lines.findIndex(
+        line => /^Muted$/i.test(line)
+      );
+
+      if (mutedIndex <= 0) return null;
+
+      const subject = lines[mutedIndex - 1];
+      const match = subject.match(/^([a-zA-Z][a-zA-Z0-9_-]*)/);
+
+      return match ? match[1] : null;
+    }
+
+    function splitIntoSegments(raw, isPlatform) {
+      if (!raw.includes(EMAIL_MARKER)) {
+        return [{
+          text: raw.trim(),
+          company: extractCompany(raw, isPlatform),
+          clipped: CLIPPED_RE.test(raw),
+        }];
       }
-      return map;
+
+      const parts = raw.split(EMAIL_MARKER);
+      const segments = [];
+
+      for (let i = 1; i < parts.length; i++) {
+        const body = parts[i].trim();
+        if (!body) continue;
+        const header = (parts[i - 1] || '').trim();
+        const company = extractCompany(header, isPlatform);
+        segments.push({
+          text: body,
+          company: company || null,
+          clipped: CLIPPED_RE.test(header + '\n' + body),
+        });
+      }
+
+      return segments;
     }
 
     function formatEventList(events) {
-      const quoted = events.map(e => `\`${e}\``);
+      const quoted = [...new Set(events)].map(e => `\`${e}\``).sort((a, b) =>
+        eventPriority(a.slice(1, -1)) - eventPriority(b.slice(1, -1))
+      );
+
       if (quoted.length === 1) return `${quoted[0]} event`;
       if (quoted.length === 2) return `${quoted[0]} and ${quoted[1]} events`;
       return `${quoted.slice(0, -1).join(', ')} and ${quoted.at(-1)} events`;
@@ -176,116 +173,235 @@
     }
 
     function buildGroupBlock(errorSetKey, entries, showCompany) {
-      const sortedEntries = showCompany
-        ? [...entries].sort((a, b) => (a.company || '').localeCompare(b.company || ''))
-        : entries;
-      entries = sortedEntries;
-      const errors       = deserializeErrorSet(errorSetKey);
-      const sortedEvents = sortByEventPriority(errors.map(e => e.event));
-      const sortedErrors = sortedEvents.map(ev => errors.find(e => e.event === ev));
+      const errors = deserializeErrorSet(errorSetKey);
+      const sortedEvents = sortByEventPriority([...new Set(errors.map(e => e.event))]);
 
+      const sortedErrors = sortedEvents.map(ev => errors.find(e => e.event === ev)).filter(Boolean);
       const statuses = [...new Set(sortedErrors.map(e => e.status))].filter(Boolean);
-      const codes    = [...new Set(sortedErrors.map(e => e.code))];
+      const codes = [...new Set(sortedErrors.map(e => e.code))];
 
       const statusStr = statuses.length ? `\`${statuses.join('/')}\` status ` : '';
-      const prefix    = `${statusStr}webhook error response (\`${codes.join('/')}\`)`;
-      const label     = entries.length === 1 ? 'masterId' : 'masterIds';
+      const prefix = `${statusStr}webhook error response (\`${codes.join('/')}\`)`;
+      const label = entries.length === 1 ? 'masterId' : 'masterIds';
 
       return ` ${prefix} for ${formatEventList(sortedEvents)} for the following ${label}:\n${formatMasterIdList(entries, showCompany)}`;
     }
 
     function buildSingleCompanyOutput(masterIdToErrors) {
-      const grouped = groupByErrorSet(masterIdToErrors);
+      const grouped = new Map();
+      for (const [masterId, errors] of masterIdToErrors) {
+        const key = serializeErrorSet(errors);
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key).push({ masterId });
+      }
+
       return [...grouped.entries()]
-        .map(([key, entries], i) => (i > 0 ? '\nand' : '') + buildGroupBlock(key, entries, false))
+        .map(([key, entries], i) =>
+          (i > 0 ? '\nand' : '') + buildGroupBlock(key, entries, false)
+        )
         .join('');
     }
 
     function buildMultiCompanyOutput(segments) {
       const errorSetToEntries = new Map();
-
       const seen = new Set();
+
       for (const { company, text } of segments) {
-        for (const [masterId, errors] of parseSegment(text)) {
-          const dedupKey = masterId + '\x02' + company;
+        const { found } = extractMasterIdErrors(normalizeText(text));
+
+        for (const [masterId, errors] of found) {
+          const dedupKey = `${masterId}\x02${company}`;
           if (seen.has(dedupKey)) continue;
           seen.add(dedupKey);
+
           const key = serializeErrorSet(errors);
           if (!errorSetToEntries.has(key)) errorSetToEntries.set(key, []);
           errorSetToEntries.get(key).push({ masterId, company });
         }
       }
 
-      const shared = [];
-      const uniqueByCompany = new Map();
+      let output = '';
+      let isFirst = true;
 
       for (const [key, entries] of errorSetToEntries) {
         const companies = new Set(entries.map(e => e.company));
-        if (companies.size > 1) {
-          shared.push([key, entries]);
+        const isShared = companies.size > 1;
+        const block = buildGroupBlock(key, entries, isShared);
+
+        if (isShared) {
+          output += (isFirst ? ' ' : '\nand ') + `we received${block}`;
         } else {
           const company = [...companies][0];
-          if (!uniqueByCompany.has(company)) uniqueByCompany.set(company, []);
-          uniqueByCompany.get(company).push([key, entries]);
+          output += (isFirst ? '' : '\nand ') + `for \`${company}\` we received${block}`;
         }
+        isFirst = false;
       }
 
-      const sharedBlocks = shared
-        .map(([key, entries], i) =>
-          (i === 0 ? ' ' : '\nand ') + `we received${buildGroupBlock(key, entries, true)}`
-        )
-        .join('');
+      return output;
+    }
 
-      const uniqueBlocks = [...uniqueByCompany.entries()].sort((a, b) => a[0].localeCompare(b[0]))
-        .flatMap(([company, groups]) =>
-          groups.map(([key, entries]) =>
-            `for \`${company}\` we received${buildGroupBlock(key, entries, false)}`
-          )
-        )
-        .join('\n');
+    function hasUnknownEvent(found) {
+      for (const errors of found.values()) {
+        for (const errStr of errors) {
+          if (deserializeError(errStr).event === 'unknown') return true;
+        }
+      }
+      return false;
+    }
 
-      return [sharedBlocks, uniqueBlocks].filter(Boolean).join('\n');
+    function hasUnknownCode(found) {
+      for (const errors of found.values()) {
+        for (const errStr of errors) {
+          if (deserializeError(errStr).code === 'unknown') return true;
+        }
+      }
+      return false;
     }
 
     function formatOutput(rawText, isPlatform) {
+      const missing = [];
+      const warnings = [];
+
       if (!isPlatform) {
-        return `hi @channel, we received${buildSingleCompanyOutput(parseSegment(rawText))}`;
+        const normalized = normalizeText(rawText);
+        const { found, missing: m } = extractMasterIdErrors(normalized);
+        const company = extractCompany(rawText, false);
+        missing.push(...m.map(e => ({ ...e, company })));
+
+        if (found.size === 0 && m.length === 0) {
+          warnings.push({ type: 'empty' });
+        }
+        if (hasUnknownEvent(found)) {
+          warnings.push({ type: 'unknown_event', company });
+        }
+        if (found.size > 0 && hasUnknownCode(found)) {
+          warnings.push({ type: 'no_error_response', company });
+        }
+        if (CLIPPED_RE.test(rawText)) {
+          warnings.push({ type: 'clipped', company });
+        }
+
+        const text = found.size > 0
+          ? `hi @channel, we received${buildSingleCompanyOutput(found)}`
+          : '';
+
+        return { text, missing, warnings };
       }
 
-      const segments = splitIntoCompanySegments(rawText).filter(s => s.company);
+      const segments = splitIntoSegments(rawText, isPlatform);
 
-      if (!segments.length) {
-        return `hi @channel, we received${buildSingleCompanyOutput(parseSegment(rawText))}`;
+      if (segments.length === 0) {
+        warnings.push({ type: 'empty' });
+        return { text: '', missing: [], warnings };
       }
 
-      if (segments.length === 1) {
-        return `hi @channel, for \`${segments[0].company}\` we received${buildSingleCompanyOutput(parseSegment(segments[0].text))}`;
+      if (segments.length === 1 && !segments[0].company) {
+        const { found, missing: m } = extractMasterIdErrors(normalizeText(segments[0].text));
+        const company = extractCompany(rawText, isPlatform);
+        missing.push(...m.map(e => ({ ...e, company })));
+
+        if (found.size === 0 && m.length === 0) warnings.push({ type: 'empty' });
+        if (hasUnknownEvent(found)) warnings.push({ type: 'unknown_event', company });
+        if (found.size > 0 && hasUnknownCode(found)) warnings.push({ type: 'no_error_response', company });
+        if (segments[0].clipped) warnings.push({ type: 'clipped', company });
+
+        const text = found.size > 0
+          ? `hi @channel, we received${buildSingleCompanyOutput(found)}`
+          : '';
+
+        return { text, missing, warnings };
       }
 
-      return `hi @channel, ${buildMultiCompanyOutput(segments)}`;
+      for (const seg of segments) {
+        const { found, missing: m } = extractMasterIdErrors(normalizeText(seg.text));
+        missing.push(...m.map(e => ({ ...e, company: seg.company })));
+
+        if (!seg.company) warnings.push({ type: 'no_company' });
+        if (seg.clipped) warnings.push({ type: 'clipped', company: seg.company });
+        if (hasUnknownEvent(found)) warnings.push({ type: 'unknown_event', company: seg.company });
+        if (found.size > 0 && hasUnknownCode(found)) warnings.push({ type: 'no_error_response', company: seg.company });
+      }
+
+      const multiText = buildMultiCompanyOutput(segments);
+      const text = multiText ? `hi @channel, ${multiText}` : '';
+
+      return { text, missing, warnings };
     }
 
+    const liveWarning = document.createElement('div');
+    liveWarning.className = 'error-box live-warning';
+    liveWarning.id = 'liveWarning';
+    liveWarning.hidden = true;
+    document.getElementById('input').insertAdjacentElement('afterend', liveWarning);
+
+    document.getElementById('input').addEventListener('input', () => {
+      if (CLIPPED_RE.test(document.getElementById('input').value)) {
+        liveWarning.textContent = '⚠ Clipped message. Please open the full message in Gmail and paste the complete text';
+        liveWarning.hidden = false;
+      } else {
+        liveWarning.hidden = true;
+      }
+    });
+
     document.getElementById('parseBtn').addEventListener('click', () => {
-      const rawText = document.getElementById('input').value;
-      if (!rawText.trim()) return;
+      const rawText = document.getElementById('input').value.trim();
+      if (!rawText) return;
 
       const isPlatform = document.getElementById('platformCheckbox').checked;
-      document.getElementById('output').value =
-        formatOutput(rawText, isPlatform) + '\nCould you please let us know how it looks on your end?';
+      const { text, missing, warnings } = formatOutput(rawText, isPlatform);
+
+      document.getElementById('output').value = text
+        ? text + '\nCould you please let us know how it looks on your end?'
+        : '';
+
+      const errorBox = document.getElementById('errorBox');
+      const lines = [];
+
+      for (const w of warnings) {
+        if (w.type === 'empty') {
+          lines.push('⚠ Nothing could be parsed from the input - check the format');
+        } else if (w.type === 'clipped') {
+          const comp = w.company ? ` for <code>${w.company}</code>` : '';
+          lines.push(`⚠ Message clipped${comp} - paste the full text`);
+        } else if (w.type === 'no_company') {
+          lines.push('⚠ One segment has no company name detected');
+        } else if (w.type === 'unknown_event') {
+          const comp = w.company ? ` (<code>${w.company}</code>)` : '';
+          lines.push(`⚠ Unknown event type${comp} - check the raw error`);
+        } else if (w.type === 'no_error_response') {
+          const comp = w.company ? ` (<code>${w.company}</code>)` : '';
+          lines.push(`⚠ Error response not recognized${comp} - check the raw error format`);
+        }
+      }
+
+      for (const { event, status, code, company } of missing) {
+        const parts = [];
+        if (company) parts.push(`company: <code>${company}</code>`);
+        if (event && event !== 'unknown') parts.push(`event: <code>${event}</code>`);
+        if (status) parts.push(`status: <code>${status}</code>`);
+        if (code && code !== 'unknown') parts.push(`code: <code>${code}</code>`);
+        lines.push(`⚠ Letter without masterId - ${parts.join(' · ')}`);
+      }
+
+      errorBox.innerHTML = lines.join('<br>');
+      errorBox.hidden = lines.length === 0;
     });
 
     document.getElementById('copyBtn').addEventListener('click', () => {
       const output = document.getElementById('output').value;
-      if (!output.trim()) return;
-      navigator.clipboard.writeText(output);
-      const btn = document.getElementById('copyBtn');
-      btn.textContent = '✅ Copied!';
-      btn.classList.add('copied');
-      setTimeout(() => {
-        btn.textContent = 'Copy Output';
-        btn.classList.remove('copied');
-      }, 1500);
+      if (!output) return;
+
+      navigator.clipboard.writeText(output).then(() => {
+        const btn = document.getElementById('copyBtn');
+        const original = btn.textContent;
+        btn.textContent = '✅ Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = original;
+          btn.classList.remove('copied');
+        }, 1600);
+      }).catch(() => {});
     });
-  </script>
+</script>
 </body>
 </html>
