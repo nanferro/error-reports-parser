@@ -269,32 +269,6 @@
       const missing = [];
       const warnings = [];
 
-      if (!isPlatform) {
-        const normalized = normalizeText(rawText);
-        const { found, missing: m } = extractMasterIdErrors(normalized);
-        const company = extractCompany(rawText, false);
-        missing.push(...m.map(e => ({ ...e, company })));
-
-        if (found.size === 0 && m.length === 0) {
-          warnings.push({ type: 'empty' });
-        }
-        if (hasUnknownEvent(found)) {
-          warnings.push({ type: 'unknown_event', company });
-        }
-        if (found.size > 0 && hasUnknownCode(found)) {
-          warnings.push({ type: 'no_error_response', company });
-        }
-        if (CLIPPED_RE.test(rawText)) {
-          warnings.push({ type: 'clipped', company });
-        }
-
-        const text = found.size > 0
-          ? `hi @channel, we received${buildSingleCompanyOutput(found)}`
-          : '';
-
-        return { text, missing, warnings };
-      }
-
       const segments = splitIntoSegments(rawText, isPlatform);
 
       if (segments.length === 0) {
@@ -302,31 +276,37 @@
         return { text: '', missing: [], warnings };
       }
 
-      if (segments.length === 1 && !segments[0].company) {
-        const { found, missing: m } = extractMasterIdErrors(normalizeText(segments[0].text));
-        const company = extractCompany(rawText, isPlatform);
-        missing.push(...m.map(e => ({ ...e, company })));
-
-        if (found.size === 0 && m.length === 0) warnings.push({ type: 'empty' });
-        if (hasUnknownEvent(found)) warnings.push({ type: 'unknown_event', company });
-        if (found.size > 0 && hasUnknownCode(found)) warnings.push({ type: 'no_error_response', company });
-        if (segments[0].clipped) warnings.push({ type: 'clipped', company });
-
-        const text = found.size > 0
-          ? `hi @channel, we received${buildSingleCompanyOutput(found)}`
-          : '';
-
-        return { text, missing, warnings };
-      }
-
+      const allFound = new Map();
+      
       for (const seg of segments) {
         const { found, missing: m } = extractMasterIdErrors(normalizeText(seg.text));
+        
+        for (const [masterId, errors] of found) {
+          if (!allFound.has(masterId)) allFound.set(masterId, new Set());
+          for (const err of errors) {
+            allFound.get(masterId).add(err);
+          }
+        }
+        
         missing.push(...m.map(e => ({ ...e, company: seg.company })));
 
-        if (!seg.company) warnings.push({ type: 'no_company' });
         if (seg.clipped) warnings.push({ type: 'clipped', company: seg.company });
         if (hasUnknownEvent(found)) warnings.push({ type: 'unknown_event', company: seg.company });
         if (found.size > 0 && hasUnknownCode(found)) warnings.push({ type: 'no_error_response', company: seg.company });
+      }
+
+      if (allFound.size === 0 && missing.length === 0) {
+        warnings.push({ type: 'empty' });
+      }
+
+      const companies = new Set(segments.map(s => s.company).filter(Boolean));
+      const isSingleCompany = !isPlatform || (companies.size <= 1 && segments.every(s => !s.company || companies.has(s.company)));
+
+      if (isSingleCompany) {
+        const text = allFound.size > 0
+          ? `hi @channel, we received${buildSingleCompanyOutput(allFound)}`
+          : '';
+        return { text, missing, warnings };
       }
 
       const multiText = buildMultiCompanyOutput(segments);
