@@ -313,7 +313,7 @@
       }
  
       const companies = new Set(segments.map(s => s.company).filter(Boolean));
-      const isSingleCompany = !isPlatform || (companies.size <= 1 && segments.every(s => !s.company || companies.has(s.company)));
+      const isSingleCompany = !isPlatform;
  
       if (isSingleCompany) {
         const text = allFound.size > 0
