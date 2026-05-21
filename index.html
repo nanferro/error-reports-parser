@@ -31,32 +31,36 @@
     </div>
   </div>
 
-  <script>
+    <script>
     const EVENT_ORDER = [
       e => e === 'FORM_SUBMITTED',
       e => e.startsWith('LAB'),
+      e => e === 'BOOKING_CREATED',
       e => e.startsWith('BOOKING'),
       e => e === 'RX_WRITTEN',
+      e => e === 'PHARMACY_ORDER_IN_FULFILLMENT',
+      e => e === 'PHARMACY_ORDER_SHIPPED',
+      e => e === 'PHARMACY_ORDER_DELIVERED',
       e => e.startsWith('PHARMACY'),
       e => e === 'CS_MESSAGE',
       e => e === 'DOCTOR_CHAT',
       e => e === 'CONSULT_CONCLUDED',
     ];
-
+ 
     const KEY_SEP = '\x00';
     const FIELD_SEP = '\x01';
     const EMAIL_MARKER = 'admin@support.belugahealth.com';
     const CLIPPED_RE = /\[Message clipped\]/i;
-
+ 
     function eventPriority(event) {
       const idx = EVENT_ORDER.findIndex(fn => fn(event));
       return idx === -1 ? EVENT_ORDER.length : idx;
     }
-
+ 
     function sortByEventPriority(events) {
       return [...events].sort((a, b) => eventPriority(a) - eventPriority(b));
     }
-
+ 
     function normalizeText(raw) {
       return raw
         .replace(/\\?[\r\n]+/g, ' ')
@@ -64,74 +68,79 @@
         .replace(/(?<=\w)"(?=\w)/g, '')
         .replace(/\\"+/g, '"');
     }
-
+ 
     function serializeError(status, code, event) {
       return [status || '', code || 'unknown', event || 'unknown'].join(FIELD_SEP);
     }
-
+ 
     function deserializeError(entry) {
       const [status, code, event] = entry.split(FIELD_SEP);
       return { status, code, event };
     }
-
+ 
     function serializeErrorSet(errors) {
       return [...errors].sort().join(KEY_SEP);
     }
-
+ 
     function deserializeErrorSet(key) {
       return key.split(KEY_SEP).map(deserializeError);
     }
-
+ 
+    function groupPriority(errorSetKey) {
+      const errors = deserializeErrorSet(errorSetKey);
+      return Math.min(...errors.map(e => eventPriority(e.event)));
+    }
+ 
     function extractMasterIdErrors(normalized) {
       const masterIdPattern = /["']?[Mm]aster[Ii]d["']?\s*[:=]\s*["']?([^"'\s,}]+)/g;
       const statusPattern = /["']?status["']?\s*[:=]\s*["']?([0-9]{3}|null)["']?/;
       const codePattern = /["']?code["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
       const eventPattern = /["']?event["']?\s*[:=]\s*["']?([A-Z_]+)["']?/;
-
+ 
       const status = normalized.match(statusPattern)?.[1]?.replace('null', '') || '';
       const code = normalized.match(codePattern)?.[1] ?? 'unknown';
       const event = normalized.match(eventPattern)?.[1] ?? 'unknown';
-
+ 
       const masterIds = [...normalized.matchAll(masterIdPattern)].map(m => m[1]);
-
+ 
       const found = new Map();
       const missing = [];
-
+ 
       if (!masterIds.length) {
         if (event !== 'unknown' || status || code !== 'unknown') {
           missing.push({ event, status, code });
         }
         return { found, missing };
       }
-
+ 
       for (const masterId of masterIds) {
         if (!found.has(masterId)) found.set(masterId, new Set());
         found.get(masterId).add(serializeError(status, code, event));
       }
-
+ 
       return { found, missing };
     }
-
+ 
     function extractCompany(text, isPlatform) {
       if (!text) return null;
-
+ 
       const lines = text
         .split(/\r?\n/)
         .map(l => l.trim())
         .filter(Boolean);
-
+ 
       const mutedIndex = lines.findIndex(
         line => /^Muted$/i.test(line)
       );
-
+ 
       if (mutedIndex <= 0) return null;
-
+ 
       const subject = lines[mutedIndex - 1];
       const match = subject.match(/^([a-zA-Z][a-zA-Z0-9_-]*)/);
-
+ 
       return match ? match[1] : null;
     }
-
+ 
     function splitIntoSegments(raw, isPlatform) {
       if (!raw.includes(EMAIL_MARKER)) {
         return [{
@@ -140,10 +149,10 @@
           clipped: CLIPPED_RE.test(raw),
         }];
       }
-
+ 
       const parts = raw.split(EMAIL_MARKER);
       const segments = [];
-
+ 
       for (let i = 1; i < parts.length; i++) {
         const body = parts[i].trim();
         if (!body) continue;
@@ -155,20 +164,20 @@
           clipped: CLIPPED_RE.test(header + '\n' + body),
         });
       }
-
+ 
       return segments;
     }
-
+ 
     function formatEventList(events) {
       const quoted = [...new Set(events)].map(e => `\`${e}\``).sort((a, b) =>
         eventPriority(a.slice(1, -1)) - eventPriority(b.slice(1, -1))
       );
-
+ 
       if (quoted.length === 1) return `${quoted[0]} event`;
       if (quoted.length === 2) return `${quoted[0]} and ${quoted[1]} events`;
       return `${quoted.slice(0, -1).join(', ')} and ${quoted.at(-1)} events`;
     }
-
+ 
     function formatMasterIdList(entries, showCompany) {
       const numbered = entries.length > 10;
       return entries.map(({ masterId, company }, i) => {
@@ -178,22 +187,22 @@
           : `● \`${masterId}\`${companyTag}`;
       }).join('\n');
     }
-
+ 
     function buildGroupBlock(errorSetKey, entries, showCompany) {
       const errors = deserializeErrorSet(errorSetKey);
       const sortedEvents = sortByEventPriority([...new Set(errors.map(e => e.event))]);
-
+ 
       const sortedErrors = sortedEvents.map(ev => errors.find(e => e.event === ev)).filter(Boolean);
       const statuses = [...new Set(sortedErrors.map(e => e.status))].filter(Boolean);
       const codes = [...new Set(sortedErrors.map(e => e.code))];
-
+ 
       const statusStr = statuses.length ? `\`${statuses.join('/')}\` status ` : '';
       const prefix = `${statusStr}webhook error response (\`${codes.join('/')}\`)`;
       const label = entries.length === 1 ? 'masterId' : 'masterIds';
-
+ 
       return ` ${prefix} for ${formatEventList(sortedEvents)} for the following ${label}:\n${formatMasterIdList(entries, showCompany)}`;
     }
-
+ 
     function buildSingleCompanyOutput(masterIdToErrors) {
       const grouped = new Map();
       for (const [masterId, errors] of masterIdToErrors) {
@@ -201,40 +210,44 @@
         if (!grouped.has(key)) grouped.set(key, []);
         grouped.get(key).push({ masterId });
       }
-
+ 
       return [...grouped.entries()]
+        .sort(([keyA], [keyB]) => groupPriority(keyA) - groupPriority(keyB))
         .map(([key, entries], i) =>
           (i > 0 ? '\nand' : '') + buildGroupBlock(key, entries, false)
         )
         .join('');
     }
-
+ 
     function buildMultiCompanyOutput(segments) {
       const errorSetToEntries = new Map();
       const seen = new Set();
-
+ 
       for (const { company, text } of segments) {
         const { found } = extractMasterIdErrors(normalizeText(text));
-
+ 
         for (const [masterId, errors] of found) {
           const dedupKey = `${masterId}\x02${company}`;
           if (seen.has(dedupKey)) continue;
           seen.add(dedupKey);
-
+ 
           const key = serializeErrorSet(errors);
           if (!errorSetToEntries.has(key)) errorSetToEntries.set(key, []);
           errorSetToEntries.get(key).push({ masterId, company });
         }
       }
-
+ 
+      const sortedEntries = [...errorSetToEntries.entries()]
+        .sort(([keyA], [keyB]) => groupPriority(keyA) - groupPriority(keyB));
+ 
       let output = '';
       let isFirst = true;
-
-      for (const [key, entries] of errorSetToEntries) {
+ 
+      for (const [key, entries] of sortedEntries) {
         const companies = new Set(entries.map(e => e.company));
         const isShared = companies.size > 1;
         const block = buildGroupBlock(key, entries, isShared);
-
+ 
         if (isShared) {
           output += (isFirst ? ' ' : '\nand ') + `we received${block}`;
         } else {
@@ -243,10 +256,10 @@
         }
         isFirst = false;
       }
-
+ 
       return output;
     }
-
+ 
     function hasUnknownEvent(found) {
       for (const errors of found.values()) {
         for (const errStr of errors) {
@@ -255,7 +268,7 @@
       }
       return false;
     }
-
+ 
     function hasUnknownCode(found) {
       for (const errors of found.values()) {
         for (const errStr of errors) {
@@ -264,18 +277,18 @@
       }
       return false;
     }
-
+ 
     function formatOutput(rawText, isPlatform) {
       const missing = [];
       const warnings = [];
-
+ 
       const segments = splitIntoSegments(rawText, isPlatform);
-
+ 
       if (segments.length === 0) {
         warnings.push({ type: 'empty' });
         return { text: '', missing: [], warnings };
       }
-
+ 
       const allFound = new Map();
       
       for (const seg of segments) {
@@ -289,38 +302,38 @@
         }
         
         missing.push(...m.map(e => ({ ...e, company: seg.company })));
-
+ 
         if (seg.clipped) warnings.push({ type: 'clipped', company: seg.company });
         if (hasUnknownEvent(found)) warnings.push({ type: 'unknown_event', company: seg.company });
         if (found.size > 0 && hasUnknownCode(found)) warnings.push({ type: 'no_error_response', company: seg.company });
       }
-
+ 
       if (allFound.size === 0 && missing.length === 0) {
         warnings.push({ type: 'empty' });
       }
-
+ 
       const companies = new Set(segments.map(s => s.company).filter(Boolean));
       const isSingleCompany = !isPlatform || (companies.size <= 1 && segments.every(s => !s.company || companies.has(s.company)));
-
+ 
       if (isSingleCompany) {
         const text = allFound.size > 0
           ? `hi @channel, we received${buildSingleCompanyOutput(allFound)}`
           : '';
         return { text, missing, warnings };
       }
-
+ 
       const multiText = buildMultiCompanyOutput(segments);
       const text = multiText ? `hi @channel, ${multiText}` : '';
-
+ 
       return { text, missing, warnings };
     }
-
+ 
     const liveWarning = document.createElement('div');
     liveWarning.className = 'error-box live-warning';
     liveWarning.id = 'liveWarning';
     liveWarning.hidden = true;
     document.getElementById('input').insertAdjacentElement('afterend', liveWarning);
-
+ 
     document.getElementById('input').addEventListener('input', () => {
       if (CLIPPED_RE.test(document.getElementById('input').value)) {
         liveWarning.textContent = '⚠ Clipped message. Please open the full message in Gmail and paste the complete text';
@@ -340,10 +353,10 @@
       document.getElementById('output').value = text
         ? text + '\nCould you please let us know how it looks on your end?'
         : '';
-
+ 
       const errorBox = document.getElementById('errorBox');
       const lines = [];
-
+ 
       for (const w of warnings) {
         if (w.type === 'empty') {
           lines.push('⚠ Nothing could be parsed from the input - check the format');
@@ -360,7 +373,7 @@
           lines.push(`⚠ Error response not recognized${comp} - check the raw error format`);
         }
       }
-
+ 
       for (const { event, status, code, company } of missing) {
         const parts = [];
         if (company) parts.push(`company: <code>${company}</code>`);
@@ -369,15 +382,15 @@
         if (code && code !== 'unknown') parts.push(`code: <code>${code}</code>`);
         lines.push(`⚠ Letter without masterId - ${parts.join(' · ')}`);
       }
-
+ 
       errorBox.innerHTML = lines.join('<br>');
       errorBox.hidden = lines.length === 0;
     });
-
+ 
     document.getElementById('copyBtn').addEventListener('click', () => {
       const output = document.getElementById('output').value;
       if (!output) return;
-
+ 
       navigator.clipboard.writeText(output).then(() => {
         const btn = document.getElementById('copyBtn');
         const original = btn.textContent;
@@ -389,7 +402,7 @@
         }, 1600);
       }).catch(() => {});
     });
-
+ 
     document.getElementById('closeSticky').addEventListener('click', () => {
       document.getElementById('stickyNote').style.display = 'none';
     });
