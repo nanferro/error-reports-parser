@@ -19,7 +19,17 @@
     <button id="parseBtn">Parse</button>
 
     <textarea id="output" placeholder="Formatted output will appear here..."></textarea>
-    <button id="copyBtn">Copy Output</button>
+    <div class="btn-row">
+      <button id="copyBtn">Copy Output</button>
+      <button id="renumberBtn">⟳ Renumber
+        <span class="tooltip">
+          <strong>Need to add an entry to a long list?</strong>
+          1. Paste your message into the output field<br>
+          2. Add a new entry with any number<br>
+          3. Press the button — magic ✨
+        </span>
+      </button>
+    </div>
 
     <div id="errorBox" class="error-box" hidden></div>
   <div class="sticky-note" id="stickyNote">
@@ -404,6 +414,13 @@
           btn.classList.remove('copied');
         }, 1600);
       }).catch(() => {});
+    });
+
+    document.getElementById('renumberBtn').addEventListener('click', () => {
+      const ta = document.getElementById('output');
+      if (!ta.value) return;
+      let counter = 0;
+      ta.value = ta.value.replace(/^\d+\./gm, () => `${++counter}.`);
     });
  
     document.getElementById('closeSticky').addEventListener('click', () => {
