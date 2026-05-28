@@ -179,8 +179,11 @@
     }
  
     function formatMasterIdList(entries, showCompany) {
-      const numbered = entries.length > 10;
-      return entries.map(({ masterId, company }, i) => {
+      const sorted = showCompany
+        ? [...entries].sort((a, b) => (a.company || '').localeCompare(b.company || ''))
+        : entries;
+      const numbered = sorted.length > 10;
+      return sorted.map(({ masterId, company }, i) => {
         const companyTag = showCompany && company ? ` for \`${company}\`` : '';
         return numbered
           ? `${i + 1}. \`${masterId}\`${companyTag}`
