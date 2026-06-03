@@ -168,11 +168,24 @@
         if (!body) continue;
         const header = (parts[i - 1] || '').trim();
         const company = extractCompany(header, isPlatform);
+        const isNewThread = /\bMuted\b/i.test(header);
         segments.push({
           text: body,
           company: company || null,
           clipped: CLIPPED_RE.test(header + '\n' + body),
+          isNewThread,
         });
+      }
+
+      let lastCompany = null;
+      for (const seg of segments) {
+        if (seg.company) {
+          lastCompany = seg.company;
+        } else if (!seg.isNewThread && lastCompany) {
+          seg.company = lastCompany;
+        } else if (seg.isNewThread) {
+          lastCompany = null;
+        }
       }
  
       return segments;
@@ -200,7 +213,111 @@
           : `● \`${masterId}\`${companyTag}`;
       }).join('\n');
     }
- 
+    
+    function numericPrefix(masterId) {
+      const m = masterId.match(/^(\d+)#/);
+      return m ? parseInt(m[1], 10) : null;
+    }
+    
+    function sortMasterIds(ids) {
+      return [...ids].sort((a, b) => {
+        const na = numericPrefix(a), nb = numericPrefix(b);
+        if (na !== null && nb !== null) return na - nb;
+        if (na !== null) return -1;
+        if (nb !== null) return 1;
+        return a.localeCompare(b);
+      });
+    }
+    
+    function countCompanyErrors(company, segments) {
+      let count = 0;
+      const seen = new Set();
+      for (const seg of segments) {
+        if (seg.company !== company) continue;
+        const { found } = extractMasterIdErrors(normalizeText(seg.text));
+        for (const [mid, errs] of found) {
+          for (const e of errs) {
+            const k = mid + '\x02' + e;
+            if (!seen.has(k)) { seen.add(k); count++; }
+          }
+        }
+      }
+      return count;
+    }
+    
+    function findDominantCompany(segments) {
+      const companies = [...new Set(segments.map(s => s.company).filter(Boolean))];
+      if (companies.length < 2) return null;
+    
+      const counts = new Map(companies.map(c => [c, countCompanyErrors(c, segments)]));
+      const total = [...counts.values()].reduce((s, n) => s + n, 0);
+    
+      for (const [company, count] of counts) {
+        if (count < 10) continue;
+        if (count / total < 0.6) continue;
+    
+        const errorSigs = new Set();
+        for (const seg of segments) {
+          if (seg.company !== company) continue;
+          const { found } = extractMasterIdErrors(normalizeText(seg.text));
+          for (const errs of found.values())
+            for (const e of errs) {
+              const { status, code } = deserializeError(e);
+              errorSigs.add(status + '|' + code);
+            }
+        }
+        if (errorSigs.size === 1) return company;
+      }
+      return null;
+    }
+    
+    function buildDominantBlock(company, segments) {
+      const midToEvents = new Map();
+      let status = '', code = '';
+
+      for (const seg of segments) {
+        if (seg.company !== company) continue;
+        const { found } = extractMasterIdErrors(normalizeText(seg.text));
+        for (const [mid, errs] of found) {
+          if (!midToEvents.has(mid)) midToEvents.set(mid, new Set());
+          for (const e of errs) {
+            const d = deserializeError(e);
+            midToEvents.get(mid).add(d.event);
+            if (!status) status = d.status;
+            if (!code) code = d.code;
+          }
+        }
+      }
+
+      const sigToMids = new Map();
+      for (const [mid, events] of midToEvents) {
+        const sig = sortByEventPriority([...events]).join(',');
+        if (!sigToMids.has(sig)) sigToMids.set(sig, []);
+        sigToMids.get(sig).push(mid);
+      }
+
+      const sortedSigs = [...sigToMids.keys()].sort((a, b) => {
+        const aEvs = a.split(','), bEvs = b.split(',');
+        if (bEvs.length !== aEvs.length) return bEvs.length - aEvs.length;
+        return eventPriority(aEvs[0]) - eventPriority(bEvs[0]);
+      });
+
+      const statusStr = status ? `\`${status}\` status ` : '';
+      let out = `for \`${company}\` we received ${statusStr}webhook error response (\`${code}\`):\n`;
+
+      for (const sig of sortedSigs) {
+        const events = sig.split(',');
+        const mids = sortMasterIds(sigToMids.get(sig));
+        const header = events.length === 1
+          ? `${events[0]}`
+          : `${events.slice(0, -1).map(e => `${e}`).join(', ')} and ${events.at(-1)}`;
+        out += `  ${header}:\n`;
+        mids.forEach((mid, i) => { out += `    ${mids.length === 1 ? '●' : `${i + 1}.`} \`${mid}\`\n`; });
+      }
+
+      return out.trimEnd();
+    }
+
     function buildGroupBlock(errorSetKey, entries, showCompany) {
       const errors = deserializeErrorSet(errorSetKey);
       const sortedEvents = sortByEventPriority([...new Set(errors.map(e => e.event))]);
@@ -233,34 +350,42 @@
     }
  
     function buildMultiCompanyOutput(segments) {
+      const dominant = findDominantCompany(segments);
+      const filteredSegs = dominant
+        ? segments.filter(s => s.company !== dominant)
+        : segments;
+    
       const errorSetToEntries = new Map();
       const seen = new Set();
  
-      for (const { company, text } of segments) {
+      for (const { company, text } of filteredSegs) {
         const { found } = extractMasterIdErrors(normalizeText(text));
- 
         for (const [masterId, errors] of found) {
-          const dedupKey = `${masterId}\x02${company}`;
+          const key = serializeErrorSet(errors);
+          const dedupKey = `${masterId}\x02${company}\x02${key}`;
           if (seen.has(dedupKey)) continue;
           seen.add(dedupKey);
- 
-          const key = serializeErrorSet(errors);
           if (!errorSetToEntries.has(key)) errorSetToEntries.set(key, []);
           errorSetToEntries.get(key).push({ masterId, company });
         }
       }
  
-      const sortedEntries = [...errorSetToEntries.entries()]
-        .sort(([keyA], [keyB]) => groupPriority(keyA) - groupPriority(keyB));
- 
+      const sortedEntries = [...errorSetToEntries.entries()].sort(([keyA], [keyB]) => {
+        const pA = groupPriority(keyA), pB = groupPriority(keyB);
+        if (pA !== pB) return pA - pB;
+        const cA = errorSetToEntries.get(keyA)?.[0]?.company ?? '';
+        const cB = errorSetToEntries.get(keyB)?.[0]?.company ?? '';
+        return cA.localeCompare(cB);
+      });
+    
       let output = '';
       let isFirst = true;
- 
+    
       for (const [key, entries] of sortedEntries) {
         const companies = new Set(entries.map(e => e.company));
         const isShared = companies.size > 1;
         const block = buildGroupBlock(key, entries, isShared);
- 
+    
         if (isShared) {
           output += (isFirst ? ' ' : '\nand ') + `we received${block}`;
         } else {
@@ -269,7 +394,12 @@
         }
         isFirst = false;
       }
- 
+    
+      if (dominant) {
+        const dominantBlock = buildDominantBlock(dominant, segments);
+        output = dominantBlock + (output ? '\n' + output : '');
+      }
+    
       return output;
     }
  
