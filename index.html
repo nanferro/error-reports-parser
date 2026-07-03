@@ -354,22 +354,32 @@
       const filteredSegs = dominant
         ? segments.filter(s => s.company !== dominant)
         : segments;
-    
-      const errorSetToEntries = new Map();
-      const seen = new Set();
- 
+
+      const companyMasterErrors = new Map();
+      const order = [];
+
       for (const { company, text } of filteredSegs) {
         const { found } = extractMasterIdErrors(normalizeText(text));
         for (const [masterId, errors] of found) {
-          const key = serializeErrorSet(errors);
-          const dedupKey = `${masterId}\x02${company}\x02${key}`;
-          if (seen.has(dedupKey)) continue;
-          seen.add(dedupKey);
-          if (!errorSetToEntries.has(key)) errorSetToEntries.set(key, []);
-          errorSetToEntries.get(key).push({ masterId, company });
+          const key = `${company}\x02${masterId}`;
+          if (!companyMasterErrors.has(key)) {
+            companyMasterErrors.set(key, new Set());
+            order.push(key);
+          }
+          const set = companyMasterErrors.get(key);
+          for (const e of errors) set.add(e);
         }
       }
- 
+
+      const errorSetToEntries = new Map();
+
+      for (const key of order) {
+        const [company, masterId] = key.split('\x02');
+        const setKey = serializeErrorSet(companyMasterErrors.get(key));
+        if (!errorSetToEntries.has(setKey)) errorSetToEntries.set(setKey, []);
+        errorSetToEntries.get(setKey).push({ masterId, company });
+      }
+
       const sortedEntries = [...errorSetToEntries.entries()].sort(([keyA], [keyB]) => {
         const pA = groupPriority(keyA), pB = groupPriority(keyB);
         if (pA !== pB) return pA - pB;
@@ -377,15 +387,15 @@
         const cB = errorSetToEntries.get(keyB)?.[0]?.company ?? '';
         return cA.localeCompare(cB);
       });
-    
+
       let output = '';
       let isFirst = true;
-    
+
       for (const [key, entries] of sortedEntries) {
         const companies = new Set(entries.map(e => e.company));
         const isShared = companies.size > 1;
         const block = buildGroupBlock(key, entries, isShared);
-    
+
         if (isShared) {
           output += (isFirst ? ' ' : '\nand ') + `we received${block}`;
         } else {
@@ -394,12 +404,12 @@
         }
         isFirst = false;
       }
-    
+
       if (dominant) {
         const dominantBlock = buildDominantBlock(dominant, segments);
         output = dominantBlock + (output ? '\n' + output : '');
       }
-    
+
       return output;
     }
  
