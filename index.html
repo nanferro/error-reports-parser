@@ -59,7 +59,7 @@
  
     const KEY_SEP = '\x00';
     const FIELD_SEP = '\x01';
-    const EMAIL_MARKER = 'admin@support.belugahealth.com';
+    const EMAIL_MARKER = /admin@support\.belugahealth\.com|Beluga Health/g;
     const CLIPPED_RE = /\[Message clipped\]/i;
  
     function eventPriority(event) {
@@ -152,7 +152,8 @@
     }
  
     function splitIntoSegments(raw, isPlatform) {
-      if (!raw.includes(EMAIL_MARKER)) {
+      EMAIL_MARKER.lastIndex = 0;
+      if (!EMAIL_MARKER.test(raw)) {
         return [{
           text: raw.trim(),
           company: extractCompany(raw, isPlatform),
