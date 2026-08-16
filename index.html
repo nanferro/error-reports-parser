@@ -32,14 +32,6 @@
     </div>
 
     <div id="errorBox" class="error-box" hidden></div>
-  <div class="sticky-note" id="stickyNote">
-    <button class="sticky-close" id="closeSticky">×</button>
-
-    <div class="sticky-title">Note</div>
-    <div class="sticky-text">
-      The parser is still somewhat unstable. Please double-check the generated output before sending it
-    </div>
-  </div>
 
     <script>
     const EVENT_ORDER = [
@@ -131,7 +123,7 @@
       return { found, missing };
     }
  
-    function extractCompany(text, isPlatform) {
+    function extractCompany(text) {
       if (!text) return null;
  
       const lines = text
@@ -151,12 +143,12 @@
       return match ? match[1] : null;
     }
  
-    function splitIntoSegments(raw, isPlatform) {
+    function splitIntoSegments(raw) {
       EMAIL_MARKER.lastIndex = 0;
       if (!EMAIL_MARKER.test(raw)) {
         return [{
           text: raw.trim(),
-          company: extractCompany(raw, isPlatform),
+          company: extractCompany(raw),
           clipped: CLIPPED_RE.test(raw),
         }];
       }
@@ -168,7 +160,7 @@
         const body = parts[i].trim();
         if (!body) continue;
         const header = (parts[i - 1] || '').trim();
-        const company = extractCompany(header, isPlatform);
+        const company = extractCompany(header);
         const isNewThread = /\bMuted\b/i.test(header);
         segments.push({
           text: body,
@@ -398,7 +390,7 @@
         const block = buildGroupBlock(key, entries, isShared);
 
         if (isShared) {
-          output += (isFirst ? ' ' : '\nand ') + `we received${block}`;
+          output += (isFirst ? '' : '\nand ') + `we received${block}`;
         } else {
           const company = [...companies][0];
           output += (isFirst ? '' : '\nand ') + `for \`${company}\` we received${block}`;
@@ -436,7 +428,7 @@
       const missing = [];
       const warnings = [];
  
-      const segments = splitIntoSegments(rawText, isPlatform);
+      const segments = splitIntoSegments(rawText);
  
       if (segments.length === 0) {
         warnings.push({ type: 'empty' });
@@ -466,7 +458,6 @@
         warnings.push({ type: 'empty' });
       }
  
-      const companies = new Set(segments.map(s => s.company).filter(Boolean));
       const isSingleCompany = !isPlatform;
  
       if (isSingleCompany) {
@@ -517,8 +508,6 @@
         } else if (w.type === 'clipped') {
           const comp = w.company ? ` for <code>${w.company}</code>` : '';
           lines.push(`⚠ Message clipped${comp} - paste the full text`);
-        } else if (w.type === 'no_company') {
-          lines.push('⚠ One segment has no company name detected');
         } else if (w.type === 'unknown_event') {
           const comp = w.company ? ` (<code>${w.company}</code>)` : '';
           lines.push(`⚠ Unknown event type${comp} - check the raw error`);
@@ -562,10 +551,6 @@
       if (!ta.value) return;
       let counter = 0;
       ta.value = ta.value.replace(/^\d+\./gm, () => `${++counter}.`);
-    });
- 
-    document.getElementById('closeSticky').addEventListener('click', () => {
-      document.getElementById('stickyNote').style.display = 'none';
     });
 </script>
 </body>
